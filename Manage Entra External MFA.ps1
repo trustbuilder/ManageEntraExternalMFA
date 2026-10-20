@@ -1,65 +1,52 @@
 ﻿#requires -Version 5.1
 <#
 .SYNOPSIS
-    Gère ou liste les méthodes External MFA et Microsoft Authenticator des membres d'un groupe Microsoft Entra ID.
+    Gère et liste les méthodes d'authentification des membres d'un groupe Entra ID.
 .DESCRIPTION
-    Le script se connecte à Microsoft Graph, recherche un groupe et traite ses membres utilisateurs.
-
-    Modes :
-    - Par défaut : ajoute une méthode External MFA.
-    - -Remove : supprime la méthode External MFA indiquée.
-    - -List : liste les méthodes External MFA, sans modification.
-    - -RemoveMicrosoftAuthenticatorMethods : supprime uniquement les méthodes Microsoft Authenticator.
-
-    Les modes -List, -Remove et -RemoveMicrosoftAuthenticatorMethods sont exclusifs.
-    En mode ajout ou -Remove, le nom de politique External MFA est demandé au clavier s'il n'est pas fourni.
+    Ajoute External MFA par défaut. -Remove supprime External MFA ciblée.
+    -ListExternalMFA remplace l'ancien -List : inventaire External MFA uniquement.
+    -List inventorie toutes les méthodes exposées par Graph, complétées par la
+    collection External MFA dédiée et fusionnées sans doublons.
+    -RemoveMicrosoftAuthenticatorMethods supprime uniquement Microsoft Authenticator.
+    Tous les modes explicites sont exclusifs. Les inventaires sont en lecture seule.
 .PARAMETER GroupDisplayName
-    Nom d'affichage exact du groupe Microsoft Entra ID.
+    Nom exact du groupe. PowerShell le demande s'il est absent.
 .PARAMETER ExternalMfaPolicyName
-    Nom affiché de la politique External MFA. Obligatoire uniquement en mode ajout ou -Remove ; demandé interactivement s'il est absent.
+    Nom exact de configuration External MFA, demandé si absent en ajout ou -Remove.
+.PARAMETER ListExternalMFA
+    Liste uniquement les méthodes External MFA des utilisateurs du groupe.
 .PARAMETER List
-    Liste les utilisateurs du groupe et leurs méthodes External MFA, sans modification.
+    Liste toutes les méthodes d'authentification renvoyées par Microsoft Graph.
 .PARAMETER Remove
-    Supprime la méthode External MFA associée à la politique demandée.
+    Supprime uniquement les méthodes liées à la configuration External MFA choisie.
 .PARAMETER RemoveMicrosoftAuthenticatorMethods
-    Supprime uniquement les méthodes Microsoft Authenticator des membres du groupe. Ce mode ne demande ni ne traite External MFA.
+    Supprime Microsoft Authenticator sans consulter ni modifier External MFA.
 .PARAMETER IncludeNestedGroups
-    Inclut les membres utilisateurs transitifs des groupes imbriqués.
+    Inclut les utilisateurs membres transitifs.
 .PARAMETER TenantId
-    ID ou domaine facultatif du tenant Microsoft Entra ID.
+    ID ou domaine facultatif du tenant.
 .PARAMETER NoConfirm
-    Désactive les confirmations interactives. L'alias -Force est accepté. -WhatIf reste prioritaire.
+    Désactive les confirmations des opérations. Alias Force. -WhatIf reste prioritaire.
 .PARAMETER StopOnError
-    Arrête le script à la première erreur rencontrée.
+    Arrête le traitement à la première erreur.
 .PARAMETER ExportCsvPath
-    Chemin facultatif du rapport CSV.
+    Chemin facultatif du CSV UTF-8 séparé par des points-virgules.
 .EXAMPLE
-    .\Entra External MFA.ps1
-    Demande le groupe puis la politique External MFA avant l'ajout.
+    & '.\Manage Entra External MFA.ps1' -GroupDisplayName 'TrustBuilder Users External MFA' -ListExternalMFA
 .EXAMPLE
-    .\Entra External MFA.ps1 -Remove
-    Demande le groupe puis la politique External MFA avant la suppression.
-.EXAMPLE
-    .\Entra External MFA.ps1 -GroupDisplayName "TrustBuilder Users External MFA" -List
-    Liste les utilisateurs et leurs méthodes External MFA.
-.EXAMPLE
-    .\Entra External MFA.ps1 -GroupDisplayName "TrustBuilder Users External MFA" -RemoveMicrosoftAuthenticatorMethods -WhatIf
-    Simule uniquement la suppression des méthodes Microsoft Authenticator.
+    & '.\Manage Entra External MFA.ps1' -GroupDisplayName 'TrustBuilder Users External MFA' -List
 .NOTES
-    Auteur       : Administrateur PowerShell
-    Version      : 9.1.0
-    Compatibilité: Windows PowerShell 5.1 et PowerShell 7+
-    Modules      : Microsoft.Graph.Authentication, Microsoft.Graph.Groups, Microsoft.Graph.Identity.SignIns
-
+    Version : 1.1.0
+    Compatibilité : Windows PowerShell 5.1 et PowerShell 7+.
     Disclaimer
     This sample is provided "AS IS" WITHOUT ANY EXPRESS OR IMPLIED WARRANTIES of any kind
     You use this at your own risks
 #>
-
-[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+[CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact='High')]
 param(
-    [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$GroupDisplayName,
+    [Parameter(Mandatory=$true)][ValidateNotNullOrEmpty()][string]$GroupDisplayName,
     [string]$ExternalMfaPolicyName,
+    [switch]$ListExternalMFA,
     [switch]$List,
     [switch]$Remove,
     [switch]$RemoveMicrosoftAuthenticatorMethods,
@@ -71,195 +58,253 @@ param(
 )
 
 #region Initialisation et validation
-$ErrorActionPreference = 'Stop'
-$script:Results = New-Object System.Collections.Generic.List[object]
-$modeCount = @($List, $Remove, $RemoveMicrosoftAuthenticatorMethods | Where-Object { $_ }).Count
-if ($modeCount -gt 1) { throw 'Utilisez un seul mode parmi -List, -Remove ou -RemoveMicrosoftAuthenticatorMethods.' }
-
-$policyRequired = -not $List -and -not $RemoveMicrosoftAuthenticatorMethods
-if ($policyRequired -and [string]::IsNullOrWhiteSpace($ExternalMfaPolicyName)) {
-    $operation = if ($Remove) { 'suppression External MFA' } else { 'ajout External MFA' }
-    $ExternalMfaPolicyName = Read-Host -Prompt "Saisissez le nom exact de la politique External MFA pour le mode $operation"
-    if ([string]::IsNullOrWhiteSpace($ExternalMfaPolicyName)) { throw "Le nom de la politique External MFA est obligatoire pour le mode $operation." }
+$ErrorActionPreference='Stop'
+$operationCmdlet=$PSCmdlet
+$results=New-Object System.Collections.Generic.List[object]
+$modes=@(@($ListExternalMFA,$List,$Remove,$RemoveMicrosoftAuthenticatorMethods) | Where-Object { $_ })
+if ($modes.Count -gt 1) {
+    throw 'Choisissez un seul mode : -ListExternalMFA, -List, -Remove ou -RemoveMicrosoftAuthenticatorMethods.'
 }
-if (($List -or $RemoveMicrosoftAuthenticatorMethods) -and -not [string]::IsNullOrWhiteSpace($ExternalMfaPolicyName)) {
-    Write-Warning 'Le paramètre -ExternalMfaPolicyName est ignoré dans le mode actif.'
+$isListing=$List -or $ListExternalMFA
+if (-not $isListing -and -not $RemoveMicrosoftAuthenticatorMethods -and [string]::IsNullOrWhiteSpace($ExternalMfaPolicyName)) {
+    $ExternalMfaPolicyName=Read-Host 'Nom exact de la politique External MFA'
+    if ([string]::IsNullOrWhiteSpace($ExternalMfaPolicyName)) { throw 'Le nom de politique ne peut pas être vide.' }
 }
-
-$script:Scopes = @('GroupMember.Read.All')
-if ($List) { $script:Scopes += 'UserAuthMethod-External.Read' }
-elseif ($Remove) { $script:Scopes += @('Policy.Read.All', 'UserAuthMethod-External.ReadWrite') }
-elseif ($RemoveMicrosoftAuthenticatorMethods) { $script:Scopes += @('UserAuthenticationMethod.Read.All', 'UserAuthMethod-MicrosoftAuthApp.ReadWrite') }
-else { $script:Scopes += @('Policy.Read.All', 'UserAuthMethod-External.ReadWrite') }
+$scopes=@('GroupMember.Read.All','User.Read.All')
+if ($List) { $scopes+=@('UserAuthenticationMethod.Read.All','UserAuthMethod-External.Read') }
+elseif ($ListExternalMFA) { $scopes+='UserAuthMethod-External.Read' }
+elseif ($RemoveMicrosoftAuthenticatorMethods) { $scopes+=@('UserAuthenticationMethod.Read.All','UserAuthMethod-MicrosoftAuthApp.ReadWrite') }
+else { $scopes+=@('Policy.Read.All','UserAuthMethod-External.ReadWrite') }
 #endregion Initialisation et validation
 
-#region Fonctions génériques
-function Test-RequiredModule {
-    [CmdletBinding()] param([Parameter(Mandatory = $true)][string]$Name)
-    if (-not (Get-Module -ListAvailable -Name $Name)) { throw "Module absent : $Name. Installez-le avec Install-Module $Name -Scope CurrentUser" }
-}
-function Get-PropertyValue {
-    [CmdletBinding()] param([object]$Object, [Parameter(Mandatory = $true)][string]$Name)
+#region Fonctions
+function Get-PropertyValue([object]$Object,[string]$Name) {
     if ($null -eq $Object) { return $null }
-    if ($Object.PSObject.Properties.Name -contains $Name) { return $Object.$Name }
-    if ($Object.PSObject.Properties.Name -contains 'AdditionalProperties' -and $Object.AdditionalProperties -and $Object.AdditionalProperties.ContainsKey($Name)) { return $Object.AdditionalProperties[$Name] }
+    $property=$Object.PSObject.Properties[$Name]
+    if ($null -ne $property -and $null -ne $property.Value) { return $property.Value }
+    if ($Object.AdditionalProperties -and $Object.AdditionalProperties.ContainsKey($Name)) { return $Object.AdditionalProperties[$Name] }
     return $null
 }
-function Add-Result {
-    [CmdletBinding()] param([object]$User, [string]$Action, [string]$Status, [string]$Detail, [string]$MethodId)
-    $script:Results.Add([pscustomobject]@{ DateHeure=Get-Date -Format 'yyyy-MM-dd HH:mm:ss'; UserPrincipalName=$User.UserPrincipalName; UserDisplayName=$User.DisplayName; Action=$Action; Etat=$Status; MethodId=$MethodId; Detail=$Detail })
+function Get-ExternalMethods([string]$UserId) {
+    if (Get-Command Get-MgUserAuthenticationExternalAuthenticationMethod -ErrorAction SilentlyContinue) {
+        return @(Get-MgUserAuthenticationExternalAuthenticationMethod -UserId $UserId -All -ErrorAction Stop)
+    }
+    if (Get-Command Get-MgBetaUserAuthenticationExternalAuthenticationMethod -ErrorAction SilentlyContinue) {
+        return @(Get-MgBetaUserAuthenticationExternalAuthenticationMethod -UserId $UserId -All -ErrorAction Stop)
+    }
+    throw 'Cmdlet de lecture External MFA introuvable.'
 }
-function Test-RunOperation {
-    [CmdletBinding()] param([Parameter(Mandatory = $true)][string]$Target, [Parameter(Mandatory = $true)][string]$Action)
-    if ($WhatIfPreference) { return $PSCmdlet.ShouldProcess($Target, $Action) }
+function Get-MethodLabel([object]$Method) {
+    $type=Get-PropertyValue $Method '@odata.type'
+    $label=switch ($type) {
+        '#microsoft.graph.externalAuthenticationMethod' { 'External MFA' }
+        '#microsoft.graph.microsoftAuthenticatorAuthenticationMethod' { 'Microsoft Authenticator' }
+        '#microsoft.graph.passwordAuthenticationMethod' { 'Mot de passe' }
+        '#microsoft.graph.phoneAuthenticationMethod' { 'Téléphone' }
+        '#microsoft.graph.emailAuthenticationMethod' { 'E-mail' }
+        '#microsoft.graph.fido2AuthenticationMethod' { 'FIDO2 / Passkey' }
+        '#microsoft.graph.softwareOathAuthenticationMethod' { 'Software OATH' }
+        '#microsoft.graph.hardwareOathAuthenticationMethod' { 'Hardware OATH' }
+        '#microsoft.graph.windowsHelloForBusinessAuthenticationMethod' { 'Windows Hello for Business' }
+        '#microsoft.graph.temporaryAccessPassAuthenticationMethod' { 'Temporary Access Pass' }
+        '#microsoft.graph.platformCredentialAuthenticationMethod' { 'Identifiant de plateforme' }
+        default { if ($type) { $type -replace '^#microsoft\.graph\.','' } else { 'Type non identifié' } }
+    }
+    $name=Get-PropertyValue $Method 'displayName'
+    if ($name) { return ('{0} : {1}' -f $label,$name) }
+    return $label
+}
+function Add-Result([object]$User,[string]$Action,[string]$Etat,[string]$Detail,[string]$MethodId) {
+    $results.Add([pscustomobject]@{
+        Utilisateur=$User.UserPrincipalName;Nom=$User.DisplayName
+        Action=$Action;Etat=$Etat;MethodId=$MethodId;Detail=$Detail
+    })
+}
+function Test-RunOperation([string]$Target,[string]$Action) {
+    if ($WhatIfPreference) { return $operationCmdlet.ShouldProcess($Target,$Action) }
     if ($NoConfirm) { return $true }
-    return $PSCmdlet.ShouldProcess($Target, $Action)
+    return $operationCmdlet.ShouldProcess($Target,$Action)
 }
-#endregion Fonctions génériques
+#endregion Fonctions
 
-#region Fonctions Microsoft Graph
-function Get-TargetGroup {
-    [CmdletBinding()] param([Parameter(Mandatory = $true)][string]$DisplayName)
-    $escaped = $DisplayName.Replace("'", "''")
-    $groups = @(Get-MgGroup -Filter "displayName eq '$escaped'" -ConsistencyLevel eventual -All -Property 'id,displayName' -ErrorAction Stop)
-    if ($groups.Count -eq 0) { throw "Aucun groupe ne porte exactement le nom '$DisplayName'." }
-    if ($groups.Count -gt 1) { throw "Plusieurs groupes portent le nom '$DisplayName'. Utilisez un nom unique." }
-    return $groups[0]
-}
-function Get-TargetUsers {
-    [CmdletBinding()] param([Parameter(Mandatory = $true)][string]$GroupId)
-    if ($IncludeNestedGroups) { return @(Get-MgGroupTransitiveMemberAsUser -GroupId $GroupId -All -Property 'id,displayName,userPrincipalName,accountEnabled' -ErrorAction Stop) }
-    return @(Get-MgGroupMemberAsUser -GroupId $GroupId -All -Property 'id,displayName,userPrincipalName,accountEnabled' -ErrorAction Stop)
-}
-function Get-ExternalConfiguration {
-    [CmdletBinding()] param([Parameter(Mandatory = $true)][string]$DisplayName)
-    $policy = Get-MgPolicyAuthenticationMethodPolicy -ErrorAction Stop
-    $configs = @($policy.AuthenticationMethodConfigurations | Where-Object { (Get-PropertyValue $_ '@odata.type') -eq '#microsoft.graph.externalAuthenticationMethodConfiguration' })
-    $matches = @($configs | Where-Object { (Get-PropertyValue $_ 'displayName') -eq $DisplayName })
-    if ($matches.Count -eq 0) { throw "Aucune politique External MFA ne porte le nom '$DisplayName'." }
-    if ($matches.Count -gt 1) { throw "Plusieurs politiques External MFA portent le nom '$DisplayName'." }
-    return $matches[0]
-}
-function Get-ExternalMethods {
-    [CmdletBinding()] param([Parameter(Mandatory = $true)][string]$UserId)
-    if (Get-Command Get-MgUserAuthenticationExternalAuthenticationMethod -ErrorAction SilentlyContinue) { return @(Get-MgUserAuthenticationExternalAuthenticationMethod -UserId $UserId -All -ErrorAction Stop) }
-    if (Get-Command Get-MgBetaUserAuthenticationExternalAuthenticationMethod -ErrorAction SilentlyContinue) { return @(Get-MgBetaUserAuthenticationExternalAuthenticationMethod -UserId $UserId -All -ErrorAction Stop) }
-    throw "Le cmdlet de lecture External MFA est introuvable."
-}
-function New-ExternalMethod {
-    [CmdletBinding()] param([string]$UserId, [string]$ConfigurationId, [string]$DisplayName)
-    $body = @{ '@odata.type'='#microsoft.graph.externalAuthenticationMethod'; configurationId=$ConfigurationId; displayName=$DisplayName }
-    if (Get-Command New-MgUserAuthenticationExternalAuthenticationMethod -ErrorAction SilentlyContinue) { return New-MgUserAuthenticationExternalAuthenticationMethod -UserId $UserId -BodyParameter $body -ErrorAction Stop }
-    if (Get-Command New-MgBetaUserAuthenticationExternalAuthenticationMethod -ErrorAction SilentlyContinue) { return New-MgBetaUserAuthenticationExternalAuthenticationMethod -UserId $UserId -BodyParameter $body -ErrorAction Stop }
-    throw "Le cmdlet de création External MFA est introuvable."
-}
-function Remove-ExternalMethod {
-    [CmdletBinding()] param([string]$UserId, [string]$MethodId)
-    if (Get-Command Remove-MgUserAuthenticationExternalAuthenticationMethod -ErrorAction SilentlyContinue) { Remove-MgUserAuthenticationExternalAuthenticationMethod -UserId $UserId -ExternalAuthenticationMethodId $MethodId -Confirm:$false -ErrorAction Stop; return }
-    if (Get-Command Remove-MgBetaUserAuthenticationExternalAuthenticationMethod -ErrorAction SilentlyContinue) { Remove-MgBetaUserAuthenticationExternalAuthenticationMethod -UserId $UserId -ExternalAuthenticationMethodId $MethodId -Confirm:$false -ErrorAction Stop; return }
-    throw "Le cmdlet de suppression External MFA est introuvable."
-}
-function Get-AuthenticatorMethods {
-    [CmdletBinding()] param([string]$UserId)
-    return @(Get-MgUserAuthenticationMicrosoftAuthenticatorMethod -UserId $UserId -All -ErrorAction Stop)
-}
-function Remove-AuthenticatorMethod {
-    [CmdletBinding()] param([string]$UserId, [string]$MethodId)
-    Remove-MgUserAuthenticationMicrosoftAuthenticatorMethod -UserId $UserId -MicrosoftAuthenticatorAuthenticationMethodId $MethodId -Confirm:$false -ErrorAction Stop
-}
-#endregion Fonctions Microsoft Graph
-
-#region Prérequis et connexion
-foreach ($module in 'Microsoft.Graph.Authentication','Microsoft.Graph.Groups','Microsoft.Graph.Identity.SignIns') { Test-RequiredModule $module; Import-Module $module -ErrorAction Stop }
-$connect = @{ Scopes=$script:Scopes; NoWelcome=$true; ErrorAction='Stop' }
-if ($TenantId) { $connect.TenantId = $TenantId }
-Connect-MgGraph @connect
-$group = Get-TargetGroup -DisplayName $GroupDisplayName
-$users = @(Get-TargetUsers -GroupId $group.Id)
-if ($users.Count -eq 0) { Write-Warning "Le groupe '$($group.DisplayName)' ne contient aucun utilisateur."; Disconnect-MgGraph; return }
-#endregion Prérequis et connexion
-
-#region Mode liste
-if ($List) {
-    $out = foreach ($user in $users) {
-        try {
-            $names = @(Get-ExternalMethods $user.Id | ForEach-Object { $n = Get-PropertyValue $_ 'displayName'; if ([string]::IsNullOrWhiteSpace($n)) { '<Nom non disponible>' } else { $n } })
-            [pscustomobject]@{ Utilisateur=$user.UserPrincipalName; Nom=$user.DisplayName; ExternalMfa=if ($names.Count) { $names -join ' | ' } else { 'Aucune' } }
-        } catch { [pscustomobject]@{ Utilisateur=$user.UserPrincipalName; Nom=$user.DisplayName; ExternalMfa="Erreur : $($_.Exception.Message)" } }
+#region Modules et connexion
+foreach ($module in 'Microsoft.Graph.Authentication','Microsoft.Graph.Groups','Microsoft.Graph.Identity.SignIns') {
+    if (-not (Get-Module -ListAvailable -Name $module)) {
+        throw "Module absent : $module. Installez-le avec Install-Module $module -Scope CurrentUser"
     }
-    $out | Sort-Object Utilisateur | Format-Table -AutoSize Utilisateur,Nom,ExternalMfa
-    if ($ExportCsvPath) { $out | Sort-Object Utilisateur | Export-Csv -Path $ExportCsvPath -NoTypeInformation -Encoding UTF8 -Delimiter ';' }
-    Disconnect-MgGraph; return
+    Import-Module $module -ErrorAction Stop
 }
-#endregion Mode liste
-
-#region Mode suppression Microsoft Authenticator
-if ($RemoveMicrosoftAuthenticatorMethods) {
-    foreach ($user in $users) {
-        if ($user.AccountEnabled -eq $false) { Add-Result $user 'SuppressionAuthenticator' 'Ignoré' 'Compte désactivé.' $null; continue }
-        try {
-            $methods = @(Get-AuthenticatorMethods $user.Id)
-            if ($methods.Count -eq 0) { Add-Result $user 'SuppressionAuthenticator' 'Absente' 'Aucune méthode Microsoft Authenticator.' $null; continue }
-            foreach ($method in $methods) {
-                if (-not $method.Id) { Add-Result $user 'SuppressionAuthenticator' 'Erreur' 'Méthode sans identifiant.' $null; continue }
-                if (Test-RunOperation "$($user.DisplayName) <$($user.UserPrincipalName)>" "Supprimer Microsoft Authenticator [$($method.Id)]") {
-                    Remove-AuthenticatorMethod $user.Id $method.Id
-                    Add-Result $user 'SuppressionAuthenticator' 'Supprimé' 'Méthode Microsoft Authenticator supprimée.' $method.Id
-                } else { Add-Result $user 'SuppressionAuthenticator' 'Simulé' 'Suppression non exécutée.' $method.Id }
-            }
-        } catch { Add-Result $user 'SuppressionAuthenticator' 'Erreur' $_.Exception.Message $null; if ($StopOnError) { throw } }
+if (-not $RemoveMicrosoftAuthenticatorMethods -and -not (Get-Command Get-MgUserAuthenticationExternalAuthenticationMethod -ErrorAction SilentlyContinue)) {
+    if (Get-Module -ListAvailable Microsoft.Graph.Beta.Identity.SignIns) {
+        Import-Module Microsoft.Graph.Beta.Identity.SignIns -ErrorAction Stop
     }
-} else {
-#endregion Mode suppression Microsoft Authenticator
+}
+$connect=@{Scopes=$scopes;NoWelcome=$true;ContextScope='Process';ErrorAction='Stop'}
+if ($TenantId) { $connect.TenantId=$TenantId }
+$connected=$false
+try {
+    Connect-MgGraph @connect | Out-Null
+    $connected=$true
+    $escaped=$GroupDisplayName.Replace("'","''")
+    $groups=@(Get-MgGroup -Filter "displayName eq '$escaped'" -All -Property 'id,displayName' -ErrorAction Stop)
+    if ($groups.Count -ne 1) { throw "Groupe introuvable ou ambigu : '$GroupDisplayName'." }
+    if ($IncludeNestedGroups) {
+        $users=@(Get-MgGroupTransitiveMemberAsUser -GroupId $groups[0].Id -All -Property 'id,displayName,userPrincipalName,accountEnabled' -ErrorAction Stop)
+    } else {
+        $users=@(Get-MgGroupMemberAsUser -GroupId $groups[0].Id -All -Property 'id,displayName,userPrincipalName,accountEnabled' -ErrorAction Stop)
+    }
+#endregion Modules et connexion
 
-#region Modes ajout et suppression External MFA
-    $configuration = Get-ExternalConfiguration -DisplayName $ExternalMfaPolicyName
-    $configurationId = $configuration.Id
-    $configurationName = Get-PropertyValue $configuration 'displayName'
-    if (-not $configurationName) { $configurationName = $ExternalMfaPolicyName }
-    foreach ($user in $users) {
-        if ($user.AccountEnabled -eq $false) { Add-Result $user $(if($Remove){'SuppressionExternalMfa'}else{'AjoutExternalMfa'}) 'Ignoré' 'Compte désactivé.' $null; continue }
-        try {
-            $methods = @(Get-ExternalMethods $user.Id | Where-Object { (Get-PropertyValue $_ 'configurationId') -eq $configurationId })
-            if ($Remove) {
-                if ($methods.Count -eq 0) { Add-Result $user 'SuppressionExternalMfa' 'Absente' 'Aucune méthode External MFA correspondante.' $null; continue }
-                foreach ($method in $methods) {
-                    if (Test-RunOperation "$($user.DisplayName) <$($user.UserPrincipalName)>" "Supprimer External MFA '$configurationName' [$($method.Id)]") {
-                        Remove-ExternalMethod $user.Id $method.Id
-                        Add-Result $user 'SuppressionExternalMfa' 'Supprimé' "Méthode '$configurationName' supprimée." $method.Id
-                    } else { Add-Result $user 'SuppressionExternalMfa' 'Simulé' 'Suppression non exécutée.' $method.Id }
+#region Modes liste
+    if ($isListing) {
+        foreach ($user in $users) {
+            $labels=New-Object System.Collections.Generic.List[string]
+            $seen=@{}
+            $errors=New-Object System.Collections.Generic.List[string]
+            if ($List) {
+                try {
+                    foreach ($method in @(Get-MgUserAuthenticationMethod -UserId $user.Id -All -ErrorAction Stop)) {
+                        $type=Get-PropertyValue $method '@odata.type'
+                        # External MFA est traité via sa collection dédiée ci-dessous.
+                        if ($type -eq '#microsoft.graph.externalAuthenticationMethod') { continue }
+                        $key='{0}:{1}' -f $type,$method.Id
+                        if (-not $seen.ContainsKey($key)) {
+                            $seen[$key]=$true
+                            $labels.Add((Get-MethodLabel $method))
+                        }
+                    }
+                } catch {
+                    if ($StopOnError) { throw }
+                    $errors.Add("Méthodes générales : $($_.Exception.Message)")
                 }
-            } elseif ($methods.Count -gt 0) {
-                Add-Result $user 'AjoutExternalMfa' 'DéjàPrésent' "Méthode '$configurationName' déjà configurée." $methods[0].Id
-            } elseif (Test-RunOperation "$($user.DisplayName) <$($user.UserPrincipalName)>" "Ajouter External MFA '$configurationName'") {
-                $created = New-ExternalMethod $user.Id $configurationId $configurationName
-                Add-Result $user 'AjoutExternalMfa' 'Ajouté' "Méthode '$configurationName' ajoutée." $created.Id
-            } else { Add-Result $user 'AjoutExternalMfa' 'Simulé' 'Création non exécutée.' $null }
-        } catch { Add-Result $user $(if($Remove){'SuppressionExternalMfa'}else{'AjoutExternalMfa'}) 'Erreur' $_.Exception.Message $null; if ($StopOnError) { throw } }
+            }
+            try {
+                foreach ($method in @(Get-ExternalMethods $user.Id)) {
+                    $key='external:{0}' -f $method.Id
+                    if (-not $seen.ContainsKey($key)) {
+                        $seen[$key]=$true
+                        $name=Get-PropertyValue $method 'displayName'
+                        if (-not $name) { $name=Get-PropertyValue $method 'configurationId' }
+                        $labels.Add(('External MFA : {0}' -f $name))
+                    }
+                }
+            } catch {
+                if ($StopOnError) { throw }
+                $errors.Add("External MFA : $($_.Exception.Message)")
+            }
+            $text=if ($labels.Count) { $labels -join ' | ' } elseif ($errors.Count) { 'Lecture impossible' } else { 'Aucune' }
+            if ($errors.Count) { $text+=' | Erreur : '+($errors -join ' | ') }
+            $results.Add([pscustomobject]@{Utilisateur=$user.UserPrincipalName;Nom=$user.DisplayName;Methodes=$text})
+        }
+        $results | Sort-Object Utilisateur | Format-Table -AutoSize -Wrap Utilisateur,Nom,Methodes
     }
-}
-#endregion Modes ajout et suppression External MFA
+#endregion Modes liste
 
-#region Bilan, export et déconnexion
-$script:Results | Group-Object Action,Etat | Sort-Object Name | ForEach-Object { Write-Host ('{0,-50} : {1}' -f $_.Name,$_.Count) }
-$script:Results | Sort-Object UserPrincipalName,Action,Etat | Format-Table -AutoSize UserPrincipalName,UserDisplayName,Action,Etat,MethodId,Detail
-if ($ExportCsvPath) { $script:Results | Sort-Object UserPrincipalName,Action,Etat | Export-Csv -Path $ExportCsvPath -NoTypeInformation -Encoding UTF8 -Delimiter ';' }
-Disconnect-MgGraph -ErrorAction SilentlyContinue
-#endregion Bilan, export et déconnexion
+#region Modes de modification
+    else {
+        if (-not $RemoveMicrosoftAuthenticatorMethods) {
+            $policy=Get-MgPolicyAuthenticationMethodPolicy -ErrorAction Stop
+            $configs=@($policy.AuthenticationMethodConfigurations | Where-Object {
+                (Get-PropertyValue $_ '@odata.type') -eq '#microsoft.graph.externalAuthenticationMethodConfiguration' -and
+                (Get-PropertyValue $_ 'displayName') -eq $ExternalMfaPolicyName
+            })
+            if ($configs.Count -ne 1) { throw "Configuration External MFA introuvable ou ambiguë : '$ExternalMfaPolicyName'." }
+            $configurationId=$configs[0].Id
+        }
+        foreach ($user in $users) {
+            $action=if ($RemoveMicrosoftAuthenticatorMethods) { 'SuppressionAuthenticator' } elseif ($Remove) { 'SuppressionExternalMfa' } else { 'AjoutExternalMfa' }
+            if ($user.AccountEnabled -eq $false) {
+                Add-Result $user $action 'Ignoré' 'Compte désactivé.' $null
+                continue
+            }
+            try {
+                if ($RemoveMicrosoftAuthenticatorMethods) {
+                    $methods=@(Get-MgUserAuthenticationMicrosoftAuthenticatorMethod -UserId $user.Id -All -ErrorAction Stop)
+                } else {
+                    $methods=@(Get-ExternalMethods $user.Id | Where-Object { (Get-PropertyValue $_ 'configurationId') -eq $configurationId })
+                }
+                $target="$($user.DisplayName) <$($user.UserPrincipalName)>"
+                if ($Remove -or $RemoveMicrosoftAuthenticatorMethods) {
+                    if (-not $methods.Count) { Add-Result $user $action 'Absente' 'Aucune méthode correspondante.' $null }
+                    foreach ($method in $methods) {
+                        if (-not $method.Id) { throw 'Identifiant de méthode absent.' }
+                        if (-not (Test-RunOperation $target "$action [$($method.Id)]")) {
+                            Add-Result $user $action 'NonExécuté' 'Simulation ou confirmation refusée.' $method.Id
+                            continue
+                        }
+                        if ($RemoveMicrosoftAuthenticatorMethods) {
+                            Remove-MgUserAuthenticationMicrosoftAuthenticatorMethod -UserId $user.Id -MicrosoftAuthenticatorAuthenticationMethodId $method.Id -Confirm:$false -ErrorAction Stop
+                        } else {
+                            $cmd=Get-Command Remove-MgUserAuthenticationExternalAuthenticationMethod -ErrorAction SilentlyContinue
+                            if (-not $cmd) { $cmd=Get-Command Remove-MgBetaUserAuthenticationExternalAuthenticationMethod -ErrorAction Stop }
+                            & $cmd -UserId $user.Id -ExternalAuthenticationMethodId $method.Id -Confirm:$false -ErrorAction Stop
+                        }
+                        Add-Result $user $action 'Supprimé' 'Méthode supprimée.' $method.Id
+                    }
+                } elseif ($methods.Count) {
+                    Add-Result $user $action 'DéjàPrésent' 'Méthode déjà configurée.' $methods[0].Id
+                } elseif (Test-RunOperation $target "Ajouter External MFA '$ExternalMfaPolicyName'") {
+                    $body=@{'@odata.type'='#microsoft.graph.externalAuthenticationMethod';configurationId=$configurationId;displayName=$ExternalMfaPolicyName}
+                    $cmd=Get-Command New-MgUserAuthenticationExternalAuthenticationMethod -ErrorAction SilentlyContinue
+                    if (-not $cmd) { $cmd=Get-Command New-MgBetaUserAuthenticationExternalAuthenticationMethod -ErrorAction Stop }
+                    $created=& $cmd -UserId $user.Id -BodyParameter $body -ErrorAction Stop
+                    Add-Result $user $action 'Ajouté' 'Méthode ajoutée.' $created.Id
+                } else { Add-Result $user $action 'NonExécuté' 'Simulation ou confirmation refusée.' $null }
+            } catch {
+                Add-Result $user $action 'Erreur' $_.Exception.Message $null
+                if ($StopOnError) { throw }
+            }
+        }
+        $results | Sort-Object Utilisateur,Action | Format-Table -AutoSize -Wrap
+    }
+#endregion Modes de modification
+
+#region Export et déconnexion
+    if ($ExportCsvPath) {
+        $directory=Split-Path -Path $ExportCsvPath -Parent
+        if ($directory -and -not (Test-Path -LiteralPath $directory)) {
+            New-Item -Path $directory -ItemType Directory -Force | Out-Null
+        }
+        $results | Sort-Object Utilisateur | Export-Csv -Path $ExportCsvPath -NoTypeInformation -Encoding UTF8 -Delimiter ';'
+    }
+} finally {
+    if ($connected) { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null }
+}
+#endregion Export et déconnexion
 
 <#
 .SYNOPSIS
-    Gère les méthodes External MFA et Microsoft Authenticator pour les membres d'un groupe.
+    Gestion et inventaire des méthodes d'authentification des membres d'un groupe.
 .DESCRIPTION
-    En ajout ou avec -Remove, ExternalMfaPolicyName est demandé s'il n'est pas fourni.
-    Avec -List, le script liste les méthodes External MFA sans modification.
-    Avec -RemoveMicrosoftAuthenticatorMethods, il supprime seulement Microsoft Authenticator, sans demander de politique External MFA.
+    -ListExternalMFA remplace l'ancien inventaire -List.
+    -List liste toutes les méthodes exposées par Graph, External MFA inclus.
+    Aucun inventaire ne demande de politique External MFA ni ne modifie le tenant.
+.PARAMETER GroupDisplayName
+    Nom exact du groupe Microsoft Entra ID.
+.PARAMETER ExternalMfaPolicyName
+    Nom de configuration demandé en ajout ou -Remove si absent.
+.PARAMETER ListExternalMFA
+    Inventaire External MFA uniquement.
+.PARAMETER List
+    Inventaire de toutes les méthodes exposées par Graph.
+.PARAMETER Remove
+    Suppression External MFA ciblée.
+.PARAMETER RemoveMicrosoftAuthenticatorMethods
+    Suppression autonome de Microsoft Authenticator.
+.PARAMETER IncludeNestedGroups
+    Inclut les utilisateurs membres transitifs.
+.PARAMETER TenantId
+    ID ou domaine du tenant.
+.PARAMETER NoConfirm
+    Désactive les confirmations d'opérations ; -WhatIf reste prioritaire.
+.PARAMETER StopOnError
+    Arrête le script à la première erreur.
+.PARAMETER ExportCsvPath
+    Chemin du rapport CSV.
 .EXAMPLE
-    .\Entra External MFA.ps1 -GroupDisplayName "TrustBuilder Users External MFA" -List
+    & '.\Manage Entra External MFA.ps1' -GroupDisplayName 'TrustBuilder Users External MFA' -ListExternalMFA
 .EXAMPLE
-    .\Entra External MFA.ps1 -GroupDisplayName "TrustBuilder Users External MFA" -RemoveMicrosoftAuthenticatorMethods -WhatIf
-.EXAMPLE
-    .\Entra External MFA.ps1 -Remove
+    & '.\Manage Entra External MFA.ps1' -GroupDisplayName 'TrustBuilder Users External MFA' -List -ExportCsvPath '.\Methodes.csv'
 .NOTES
-    Utilisez -WhatIf avant toute opération de suppression réelle.
+    Les erreurs de lecture sont signalées et jamais assimilées à une absence de méthode.
 #>
